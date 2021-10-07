@@ -17,15 +17,15 @@ void  YOLOXMNN::GenGridBox(const int netWidth,
                             const int netHeight)
 {
     for (int i = 0; i < 3; i++) {
-        int gridRow = int(netHeight / mStrides[i]);
-        int gridCol = int(netWidth / mStrides[i]);
+        int gridRow = int((float )netHeight / mStrides[i]);
+        int gridCol = int((float )netWidth / mStrides[i]);
         for(int row = 0; row < gridRow; row++)
         {
             for(int col = 0; col < gridCol; col++)
             {
                 GridInfo gridInfo;
-                gridInfo.gridX = col;
-                gridInfo.gridY = row;
+                gridInfo.gridX = (float)col;
+                gridInfo.gridY = (float)row;
                 gridInfo.stride = mStrides[i];
                 mGridInfos.push_back(gridInfo);
             }
@@ -46,7 +46,7 @@ cv::Mat YOLOXMNN::PreprocImage(const cv::Mat& inputImage,
     }
     memset(imageOut.data, 114, netWidth * netHeight * 3);
     fRatio = std::min((float)netWidth /(float)width, (float)netHeight / (float)height);
-    int newWidth = (int)(fRatio * width), newHeight = (int)(fRatio * height);
+    int newWidth = (int)(fRatio * (float )width), newHeight = (int)(fRatio * (float )height);
     cv::Mat rzImage;
     cv::resize(inputImage, rzImage, cv::Size(newWidth, newHeight));
     cv::Mat rectImage = imageOut(cv::Rect(0, 0, newWidth, newHeight));
@@ -85,7 +85,7 @@ void YOLOXMNN::NMS(std::vector<DetBoxes>& detBoxes,
     }
 
 }
-bool  YOLOXMNN::loadWeight(const char* weightFile)
+bool  YOLOXMNN::LoadWeight(const char* weightFile)
 {
     mNet.reset(MNN::Interpreter::createFromFile(weightFile));
     if(mNet == nullptr)
@@ -93,56 +93,61 @@ bool  YOLOXMNN::loadWeight(const char* weightFile)
         return false;
     }
     mSession = mNet->createSession(mConfig);
+    // input tensor config
+    mInputTensor = mNet->getSessionInput(mSession, NULL);
+    std::vector<int> inputShape = mInputTensor->shape();
+    mNetChannel = inputShape[1];
+    mNetHeight = inputShape[2];
+    mNetWidth = inputShape[3];
+    MNN_PRINT("input: w:%d , h:%d, c: %d\n", mNetWidth, mNetHeight, mNetChannel);
+    this->GenGridBox(mNetWidth, mNetHeight);
+    MNN_PRINT("GRID SIZE: %d \n", (int)mGridInfos.size());
+
+    // image config
+    mImageConfig.filterType = MNN::CV::BILINEAR;
+    mImageConfig.sourceFormat = MNN::CV::BGR;
+    mImageConfig.destFormat = MNN::CV::BGR;
+
+    MNN::CV::Matrix trans;
+    trans.setScale(1.0f, 1.0f);
+    mPretreat.reset(MNN::CV::ImageProcess::create(mImageConfig));
+    mPretreat->setMatrix(trans);
+
     return true;
 }
-bool YOLOXMNN::Inference(const cv::Mat& inputImage)
+bool YOLOXMNN::Inference(const cv::Mat& inputImage, std::vector<DetBoxes>& detBoxes)
 {
     if(!mSession)
     {
         return false;
     }
-    MNN::CV::Matrix trans;
-    trans.setScale(1.0f, 1.0f);
-
-    MNN::CV::ImageProcess::Config imageConfig;
-    imageConfig.filterType = MNN::CV::BILINEAR;
-    imageConfig.sourceFormat = MNN::CV::BGR;
-    imageConfig.destFormat = MNN::CV::BGR;
-
-    std::shared_ptr<MNN::CV::ImageProcess> pretreat(MNN::CV::ImageProcess::create(imageConfig));
-    pretreat->setMatrix(trans);
-
-    MNN::Tensor* inputTensor = mNet->getSessionInput(mSession, NULL);
-    std::vector<int> inputShape = inputTensor->shape();
-    int netWidth = 0, netHeight = 0, netChannel = 0;
-    netChannel = inputShape[1];
-    netHeight = inputShape[2];
-    netWidth = inputShape[3];
-    MNN_PRINT("input: w:%d , h:%d, c: %d\n", netWidth, netHeight, netChannel);
-    this->GenGridBox(netWidth, netHeight);
-    MNN_PRINT("GRID SIZE: %d \n", (int)mGridInfos.size());
-
-    float fRatio = 0;
-    cv::Mat netImage = this->PreprocImage(inputImage, netWidth, netHeight, fRatio);
-
-    pretreat->convert((uint8_t*)netImage.data, netImage.cols, netImage.rows, 0, inputTensor);
+    float ratio = 0;
+    cv::Mat netImage = this->PreprocImage(inputImage, mNetWidth, mNetHeight, ratio);
+    mPretreat->convert((uint8_t*)netImage.data, netImage.cols, netImage.rows, 0, mInputTensor);
     mNet->runSession(mSession);
-
     MNN::Tensor* outputTensor = mNet->getSessionOutput(mSession, NULL);
+    this->Postprocess(outputTensor, ratio, detBoxes);
+    return true;
+}
+void YOLOXMNN::Postprocess(const MNN::Tensor* outTensor,
+                           const float  ratio,
+                            std::vector<DetBoxes>& outBoxes)
+{
+    outBoxes.clear();
     int outHW = 0, outChannel = 0;
-    std::vector<int> outShape = outputTensor->shape();
+    std::vector<int> outShape = outTensor->shape();
     outHW = outShape[1];
     outChannel = outShape[2];
     MNN_PRINT("output: wh: %d, c: %d \n", outHW, outChannel);
-
-    MNN::Tensor offset_host(outputTensor, outputTensor->getDimensionType());
-    outputTensor->copyToHostTensor(&offset_host);
-    float* outData = offset_host.host<float>();
+    MNN::Tensor outTensorHost(outTensor, outTensor->getDimensionType());
+    outTensor->copyToHostTensor(&outTensorHost);
+    float* outData = outTensorHost.host<float>();
     MNN_PRINT("outData: index:0 , value: %.2f \n", outData[0]);
 
     std::vector<DetBoxes> detBoxes;
     for (int i = 0; i < outHW; ++i, outData+=outChannel) {
         DetBoxes  detBox;
+        // decoder
         float  centerX = (mGridInfos[i].gridX + outData[0]) * mGridInfos[i].stride;
         float  centerY = (mGridInfos[i].gridY + outData[1]) * mGridInfos[i].stride;
         detBox.w = std::exp(outData[2]) * mGridInfos[i].stride;
@@ -170,16 +175,14 @@ bool YOLOXMNN::Inference(const cv::Mat& inputImage)
     }
     std::vector<int> picked;
     this->NMS(detBoxes, picked);
-    printf("det num: %d \n",(int) picked.size());
     for (int i = 0; i < (int) picked.size() ; ++i) {
         DetBoxes&  detPickedBox = detBoxes[picked[i]];
-        cv::rectangle(netImage, cv::Point((int)detPickedBox.x,  (int)detPickedBox.y),
-                                cv::Point((int)(detPickedBox.x + detPickedBox.w),  (int)detPickedBox.y + detPickedBox.h),
-                                cv::Scalar(0, 0, 255), 2);
-        printf("index: %d, score: %.2f \n", detPickedBox.clsIndex, detPickedBox.scoreObj);
+        detPickedBox.x /= ratio;
+        detPickedBox.y /= ratio;
+        detPickedBox.w /= ratio;
+        detPickedBox.h /= ratio;
+        outBoxes.push_back(detPickedBox);
     }
-    cv::imshow("draw", netImage);
-    cv::waitKey(-1);
+    printf("det num: %d \n",(int) picked.size());
 
-    return true;
 }
