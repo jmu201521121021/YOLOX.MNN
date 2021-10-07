@@ -51,6 +51,7 @@ static void draw_objects(const cv::Mat& bgr, const std::vector<DetBoxes>& object
     }
 
     cv::imshow("image", image);
+    cv::imwrite("../../assets/dog_det.jpg", image);
     cv::waitKey(0);
 }
 
